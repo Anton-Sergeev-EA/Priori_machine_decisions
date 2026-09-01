@@ -1,6 +1,3 @@
-# syntax=docker/dockerfile:1.4
-# Базовый образ с ROS2 Humble и CUDA Toolkit.
-
 ARG TARGETPLATFORM
 ARG BASE_IMAGE
 
