@@ -1,0 +1,178 @@
+name: Build and Publish ROS2 CUDA Images
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      package_repo:
+        description: 'Package repository URL'
+        required: false
+        default: 'https://github.com/hku-mars/FAST_LIO.git'
+      package_branch:
+        description: 'Branch to build'
+        required: false
+        default: 'main'
+  release:
+    types: [ created ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ros2-cuda-package
+
+jobs:
+  cross-build:
+    name: Cross-build (${{ matrix.target }}) on x86
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            platform: linux/amd64
+            base_image: nvidia/cuda:12.2.0-devel-ubuntu22.04
+            cuda_arch: 86
+            runner_type: ubuntu-latest
+          - target: orin-agx
+            platform: linux/arm64
+            base_image: nvcr.io/nvidia/l4t-jetpack:r36.2.0
+            cuda_arch: 87
+            runner_type: ubuntu-latest
+          - target: orin-nano
+            platform: linux/arm64
+            base_image: nvcr.io/nvidia/l4t-jetpack:r36.2.0
+            cuda_arch: 87
+            runner_type: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=${{ matrix.target }}-latest
+            type=raw,value=${{ matrix.target }}-${{ github.sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/templates/Dockerfile.package
+          platforms: ${{ matrix.platform }}
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ matrix.base_image }}
+            REPO_URL=${{ github.event.inputs.package_repo || 'https://github.com/hku-mars/FAST_LIO.git' }}
+            BRANCH=${{ github.event.inputs.package_branch || 'main' }}
+            PACKAGE_NAME=fast_lio
+            CUDA_ARCH=${{ matrix.cuda_arch }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  native-build:
+    name: Native build on ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    needs: cross-build
+    if: false  # Включить, когда настроены self-hosted раннеры.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: orin-agx
+            runner: [ self-hosted, linux, arm64, orin-agx ]
+            base_image: nvcr.io/nvidia/l4t-jetpack:r36.2.0
+            cuda_arch: 87
+          - target: orin-nano
+            runner: [ self-hosted, linux, arm64, orin-nano ]
+            base_image: nvcr.io/nvidia/l4t-jetpack:r36.2.0
+            cuda_arch: 87
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (Native)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/templates/Dockerfile.package
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ matrix.base_image }}
+            REPO_URL=https://github.com/hku-mars/FAST_LIO.git
+            BRANCH=main
+            PACKAGE_NAME=fast_lio
+            CUDA_ARCH=${{ matrix.cuda_arch }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ matrix.target }}-native-latest
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ matrix.target }}-native-${{ github.sha }}
+
+  test-images:
+    name: Test images (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: cross-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            platform: linux/amd64
+          - target: orin-agx
+            platform: linux/arm64
+          - target: orin-nano
+            platform: linux/arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Test image
+        run: |
+          # Тестируем, что пакет установлен.
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ matrix.target }}-${{ github.sha }} \
+            "source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && ros2 pkg list | grep fast_lio"
+          
+          # Тестируем CUDA (только для x86, т.к. нет GPU в раннере).
+          if [ "${{ matrix.target }}" == "x86_64" ]; then
+            docker run --rm \
+              --gpus all \
+              ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ matrix.target }}-${{ github.sha }} \
+              "nvidia-smi && echo 'CUDA is available'"
+          fi
