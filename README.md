@@ -70,3 +70,7 @@ docker buildx build --memory=8g --swap=8g ...
 
 ## Лицензия.
 MIT License
+
+## Автор.
+Сергеев Антон Валентинович
+kavery@mail.ru
